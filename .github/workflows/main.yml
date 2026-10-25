@@ -1,0 +1,177 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1 -Force
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP configurado com NLA habilitado."
+
+      - name: Create RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Crie o secret RDP_PASSWORD nas configurações do GitHub."
+          }
+
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name "Skyro" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "Skyro" -Password $securePass
+          } else {
+            New-LocalUser -Name "Skyro" `
+              -Password $securePass -AccountNeverExpires | Out-Null
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" `
+            -Member "Skyro" -ErrorAction SilentlyContinue
+
+          Write-Host "Usuário Skyro configurado."
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          $proc = Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" `
+            -Wait -PassThru
+
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+          if ($proc.ExitCode -notin @(0, 3010)) {
+            throw "Falha ao instalar Tailscale: $($proc.ExitCode)"
+          }
+
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Crie o secret TAILSCALE_AUTH_KEY no GitHub."
+          }
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $ts)) {
+            throw "tailscale.exe não foi encontrado."
+          }
+
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+
+          & $ts up `
+            "--authkey=$env:TS_AUTHKEY" `
+            "--hostname=rdp-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha ao conectar o Tailscale."
+          }
+
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 12 -and !$tsIP; $i++) {
+            Start-Sleep -Seconds 5
+            $result = & $ts ip -4
+
+            if ($LASTEXITCODE -eq 0 -and $result) {
+              $tsIP = ($result | Select-Object -First 1).Trim()
+            }
+          }
+
+          if (!$tsIP) {
+            throw "Não foi possível obter o IP do Tailscale."
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "IP do Tailscale: $tsIP"
+
+      - name: Configure Restricted Firewall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale" `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Profile Any
+
+          Write-Host "Regra RDP restrita aos endereços do Tailscale."
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Start-Service TermService
+
+          $listener = Get-NetTCPConnection `
+            -State Listen -LocalPort 3389 `
+            -ErrorAction SilentlyContinue
+
+          if (!$listener) {
+            throw "O serviço não está escutando na porta 3389."
+          }
+
+          Write-Host "Serviço RDP escutando localmente."
+          Write-Host "IP Tailscale: $env:TAILSCALE_IP"
+          Write-Host "Usuário: Skyro"
+          Write-Host "A senha está configurada no secret RDP_PASSWORD."
+
+      - name: Maintain Connection
+        shell: pwsh
+        run: |
+          Write-Host "=== RDP ==="
+          Write-Host "Endereço: $env:TAILSCALE_IP"
+          Write-Host "Usuário: Skyro"
+          Write-Host "Senha: consulte o secret RDP_PASSWORD."
+          Write-Host "O runner é temporário e tem limite de execução."
+
+          while ($true) {
+            Write-Host "Runner ativo: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            Start-Sleep -Seconds 60
+          }
+          
